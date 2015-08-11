@@ -3,8 +3,8 @@
 package log4go
 
 import (
-	"os"
 	"fmt"
+	"os"
 	"time"
 )
 
@@ -57,6 +57,22 @@ func (w *FileLogWriter) Close() {
 //
 // The standard log-line format is:
 //   [%D %T] [%L] (%S) %M
+func NewDailyFileLogWriter(fname string, dailyRotate bool) *FileLogWriter {
+	w := &FileLogWriter{
+		rec:      make(chan *LogRecord, LogBufferLength),
+		rot:      make(chan bool),
+		filename: fname,
+		format:   "[%D %T] [%L] (%S) %M",
+		rotate:   dailyRotate, // 如果按天滚动则滚动，否则不滚动
+		daily:    dailyRotate,
+	}
+
+	if err := initFileLogWriter(w); err != nil {
+		return nil
+	}
+	return w
+}
+
 func NewFileLogWriter(fname string, rotate bool) *FileLogWriter {
 	w := &FileLogWriter{
 		rec:      make(chan *LogRecord, LogBufferLength),
@@ -66,10 +82,17 @@ func NewFileLogWriter(fname string, rotate bool) *FileLogWriter {
 		rotate:   rotate,
 	}
 
-	// open the file for the first time
-	if err := w.intRotate(); err != nil {
-		fmt.Fprintf(os.Stderr, "FileLogWriter(%q): %s\n", w.filename, err)
+	if err := initFileLogWriter(w); err != nil {
 		return nil
+	}
+	return w
+}
+
+func initFileLogWriter(w *FileLogWriter) error {
+	// open the file for the first time
+	if err := w.tryRotate(); err != nil {
+		fmt.Fprintf(os.Stderr, "FileLogWriter(%q): %s\n", w.filename, err)
+		return err
 	}
 
 	go func() {
@@ -83,7 +106,7 @@ func NewFileLogWriter(fname string, rotate bool) *FileLogWriter {
 		for {
 			select {
 			case <-w.rot:
-				if err := w.intRotate(); err != nil {
+				if err := w.tryRotate(); err != nil {
 					fmt.Fprintf(os.Stderr, "FileLogWriter(%q): %s\n", w.filename, err)
 					return
 				}
@@ -95,7 +118,7 @@ func NewFileLogWriter(fname string, rotate bool) *FileLogWriter {
 				if (w.maxlines > 0 && w.maxlines_curlines >= w.maxlines) ||
 					(w.maxsize > 0 && w.maxsize_cursize >= w.maxsize) ||
 					(w.daily && now.Day() != w.daily_opendate) {
-					if err := w.intRotate(); err != nil {
+					if err := w.tryRotate(); err != nil {
 						fmt.Fprintf(os.Stderr, "FileLogWriter(%q): %s\n", w.filename, err)
 						return
 					}
@@ -114,8 +137,7 @@ func NewFileLogWriter(fname string, rotate bool) *FileLogWriter {
 			}
 		}
 	}()
-
-	return w
+	return nil
 }
 
 // Request that the logs rotate
@@ -124,7 +146,7 @@ func (w *FileLogWriter) Rotate() {
 }
 
 // If this is called in a threaded context, it MUST be synchronized
-func (w *FileLogWriter) intRotate() error {
+func (w *FileLogWriter) tryRotate() error {
 	// Close any log file that may be open
 	if w.file != nil {
 		fmt.Fprint(w.file, FormatLogRecord(w.trailer, &LogRecord{Created: time.Now()}))
@@ -133,24 +155,13 @@ func (w *FileLogWriter) intRotate() error {
 
 	// If we are keeping log files, move it to the next available number
 	if w.rotate {
-		_, err := os.Lstat(w.filename)
-		if err == nil { // file exists
-			// Find the next available number
-			num := 1
-			fname := ""
-			for ; err == nil && num <= 999; num++ {
-				fname = w.filename + fmt.Sprintf(".%03d", num)
-				_, err = os.Lstat(fname)
+		if w.daily {
+			if err := w.dailyRotate(); err != nil {
+				return err
 			}
-			// return error if the last file checked still existed
-			if err == nil {
-				return fmt.Errorf("Rotate: Cannot find free log number to rename %s\n", w.filename)
-			}
-
-			// Rename the file to its newfound home
-			err = os.Rename(w.filename, fname)
-			if err != nil {
-				return fmt.Errorf("Rotate: %s\n", err)
+		} else {
+			if err := w.intRotate(); err != nil {
+				return err
 			}
 		}
 	}
@@ -172,6 +183,49 @@ func (w *FileLogWriter) intRotate() error {
 	w.maxlines_curlines = 0
 	w.maxsize_cursize = 0
 
+	return nil
+}
+
+func (w *FileLogWriter) dailyRotate() error {
+	fi, err := os.Lstat(w.filename)
+	if err == nil {
+		// 文件已经存在，检查文件最后修改时间（中的日期），如果与当前时间（的日期）不同，则生成新文件
+		modTime := fi.ModTime()
+		now := time.Now()
+		if modTime.Year() != now.Year() || modTime.YearDay() != now.YearDay() {
+			y, m, d := modTime.Date()
+			postfix := fmt.Sprintf("%d-%02d-%02d.log", y, m, d)
+			fname := w.filename + "." + postfix
+			err = os.Rename(w.filename, fname)
+			if err != nil {
+				return fmt.Errorf("Daily rotate: %s\n", err)
+			}
+		}
+	}
+	return nil
+}
+
+func (w *FileLogWriter) intRotate() error {
+	_, err := os.Lstat(w.filename)
+	if err == nil { // file exists
+		// Find the next available number
+		num := 1
+		fname := ""
+		for ; err == nil && num <= 999; num++ {
+			fname = w.filename + fmt.Sprintf(".%03d", num)
+			_, err = os.Lstat(fname)
+		}
+		// return error if the last file checked still existed
+		if err == nil {
+			return fmt.Errorf("Rotate: Cannot find free log number to rename %s\n", w.filename)
+		}
+
+		// Rename the file to its newfound home
+		err = os.Rename(w.filename, fname)
+		if err != nil {
+			return fmt.Errorf("Rotate: %s\n", err)
+		}
+	}
 	return nil
 }
 
