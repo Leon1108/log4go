@@ -33,7 +33,7 @@ type FileLogWriter struct {
 
 	// Rotate daily
 	daily          bool
-	daily_opendate int
+	daily_opendate time.Time
 
 	// Keep old logfiles (.001, .002, etc)
 	rotate bool
@@ -117,7 +117,7 @@ func initFileLogWriter(w *FileLogWriter) error {
 				now := time.Now()
 				if (w.maxlines > 0 && w.maxlines_curlines >= w.maxlines) ||
 					(w.maxsize > 0 && w.maxsize_cursize >= w.maxsize) ||
-					(w.daily && now.Day() != w.daily_opendate) {
+					(w.daily && now.Day() != w.daily_opendate.Day()) {
 					if err := w.tryRotate(); err != nil {
 						fmt.Fprintf(os.Stderr, "FileLogWriter(%q): %s\n", w.filename, err)
 						return
@@ -151,6 +151,15 @@ func (w *FileLogWriter) tryRotate() error {
 	if w.file != nil {
 		fmt.Fprint(w.file, FormatLogRecord(w.trailer, &LogRecord{Created: time.Now()}))
 		w.file.Close()
+	} else {
+		// 第一次初始化，使用文件的最后修改时间作为'daily_opendate'
+		if fi, err := os.Lstat(w.filename); err == nil {
+			w.daily_opendate = fi.ModTime()
+		} else {
+			fmt.Fprintf(os.Stderr, "FileLogWriter(%q): Fail to get file info. %s\n", w.filename, err)
+			return err
+		}
+
 	}
 
 	// If we are keeping log files, move it to the next available number
@@ -177,7 +186,7 @@ func (w *FileLogWriter) tryRotate() error {
 	fmt.Fprint(w.file, FormatLogRecord(w.header, &LogRecord{Created: now}))
 
 	// Set the daily open date to the current date
-	w.daily_opendate = now.Day()
+	w.daily_opendate = now
 
 	// initialize rotation values
 	w.maxlines_curlines = 0
@@ -187,13 +196,12 @@ func (w *FileLogWriter) tryRotate() error {
 }
 
 func (w *FileLogWriter) dailyRotate() error {
-	fi, err := os.Lstat(w.filename)
+	_, err := os.Lstat(w.filename)
 	if err == nil {
 		// 文件已经存在，检查文件最后修改时间（中的日期），如果与当前时间（的日期）不同，则生成新文件
-		modTime := fi.ModTime()
 		now := time.Now()
-		if modTime.Year() != now.Year() || modTime.YearDay() != now.YearDay() {
-			y, m, d := modTime.Date()
+		if w.daily_opendate.Day() != now.Day() {
+			y, m, d := w.daily_opendate.Date()
 			postfix := fmt.Sprintf("%d-%02d-%02d.log", y, m, d)
 			fname := w.filename + "." + postfix
 			err = os.Rename(w.filename, fname)
